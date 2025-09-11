@@ -1,0 +1,3 @@
+pp25s121@apollo01:~$ ml openmpi/ 
+Loading openmpi/5.0.8
+  Loading requirement: ucx/1.19.0
