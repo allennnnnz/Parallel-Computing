@@ -17,7 +17,7 @@ inline void merge_keep_smallest_inplace(float *a, size_t n1,
         buf[t++] = (a[i] <= b[j]) ? a[i++] : b[j++];
     while (t < k && i < n1) buf[t++] = a[i++];
     while (t < k && j < n2) buf[t++] = b[j++];
-    std::memcpy(a, buf, k * sizeof(float));
+    
 }
 
 // 合併保留最大 k 個（輸出寫回 a）
@@ -30,7 +30,7 @@ inline void merge_keep_largest_inplace(float *a, size_t n1,
         buf[--t] = (a[i-1] >= b[j-1]) ? a[--i] : b[--j];
     while (t>0 && i>0) buf[--t] = a[--i];
     while (t>0 && j>0) buf[--t] = b[--j];
-    std::memcpy(a, buf, k*sizeof(float));
+    
 }
 
 int main(int argc, char* argv[]) {
@@ -67,65 +67,60 @@ int main(int argc, char* argv[]) {
 
     // 預先分配最大可能的 neighbor buffer 和 merge buffer
     std::vector<float> neighbor_data_vec(base+1);
-    std::vector<float> merge_buf(local_n + base + 1);
+    std::vector<float> merge_buf(local_n);
+
+    if(local_n == 0){
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Finalize();
+        return 0;
+    }
+    
 
     for(int phase = 0; phase < size+1; phase++){
-        if(phase % 2 == 0){ // 偶數 phase
-            if(rank % 2 == 0 && rank + 1 < size){
-                long neighbor_n = (rank + 1 < extra) ? (base+1) : base;
+        bool i_am_left = (phase % 2 == 0) ? rank % 2 == 0 : rank % 2 == 1;
+        int peer_rank = i_am_left ? rank + 1 : rank - 1;
+        long neighbor_n = (peer_rank < extra) ? (base + 1) : base;
+        // 邊界檢查
+        if ( neighbor_n <= 0 || (i_am_left && rank + 1 >= size) || (!i_am_left && rank - 1 < 0))
+            continue;
 
-                nvtxRangePop(); nvtxRangePush("Comm");
-                MPI_Sendrecv(local_data_vec.data(), local_n, MPI_FLOAT, rank + 1, 0,
-                             neighbor_data_vec.data(), neighbor_n, MPI_FLOAT, rank + 1, 0,
-                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                nvtxRangePop(); nvtxRangePush("CPU");
+        
 
-                merge_keep_smallest_inplace(local_data_vec.data(), local_n,
-                                            neighbor_data_vec.data(), neighbor_n,
-                                            merge_buf.data(), local_n);
-            } else if(rank % 2 == 1){
-                long neighbor_n = (rank - 1 < extra) ? (base+1) : base;
+        // 先傳邊界值
+        float my_boundary = i_am_left ? local_data_vec[local_n-1]  // 左邊保留小的 => 用最大值檢查
+                                    : local_data_vec[0];         // 右邊保留大的 => 用最小值檢查
+        float neighbor_boundary = 0.0f;
 
-                nvtxRangePop(); nvtxRangePush("Comm");
-                MPI_Sendrecv(local_data_vec.data(), local_n, MPI_FLOAT, rank - 1, 0,
-                             neighbor_data_vec.data(), neighbor_n, MPI_FLOAT, rank - 1, 0,
-                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                nvtxRangePop(); nvtxRangePush("CPU");
+        MPI_Sendrecv(&my_boundary, 1, MPI_FLOAT, peer_rank, 100,
+                    &neighbor_boundary, 1, MPI_FLOAT, peer_rank, 100,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-                merge_keep_largest_inplace(local_data_vec.data(), local_n,
-                                           neighbor_data_vec.data(), neighbor_n,
-                                           merge_buf.data(), local_n);
-            }
-        } else { // 奇數 phase
-            if(rank % 2 == 1 && rank + 1 < size){
-                long neighbor_n = (rank + 1 < extra) ? (base+1) : base;
+        // 判斷是否需要傳整個 chunk
+        bool need_exchange = i_am_left ? (my_boundary > neighbor_boundary)
+                                    : (my_boundary < neighbor_boundary);
 
-                nvtxRangePop(); nvtxRangePush("Comm");
-                MPI_Sendrecv(local_data_vec.data(), local_n, MPI_FLOAT, rank + 1, 1,
-                             neighbor_data_vec.data(), neighbor_n, MPI_FLOAT, rank + 1, 1,
-                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                nvtxRangePop(); nvtxRangePush("CPU");
+        if (!need_exchange)
+            continue;  // 不需要交換整個 chunk
 
-                // 奇數 phase 中，奇數 rank 是較低索引，需保留較小的一半
-                merge_keep_smallest_inplace(local_data_vec.data(), local_n,
-                                           neighbor_data_vec.data(), neighbor_n,
-                                           merge_buf.data(), local_n);
-            } else if(rank % 2 == 0 && rank > 0){
-                long neighbor_n = (rank - 1 < extra) ? (base+1) : base;
+        // MPI 通訊整個 chunk
+        nvtxRangePop(); nvtxRangePush("Comm");
+        MPI_Sendrecv(local_data_vec.data(), local_n, MPI_FLOAT, peer_rank, phase % 2,
+                    neighbor_data_vec.data(), neighbor_n, MPI_FLOAT, peer_rank, phase % 2,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        nvtxRangePop(); nvtxRangePush("CPU");
 
-                nvtxRangePop(); nvtxRangePush("Comm");
-                MPI_Sendrecv(local_data_vec.data(), local_n, MPI_FLOAT, rank - 1, 1,
-                             neighbor_data_vec.data(), neighbor_n, MPI_FLOAT, rank - 1, 1,
-                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                nvtxRangePop(); nvtxRangePush("CPU");
-
-                // 偶數（非 0）為較高索引，需保留較大的一半
-                merge_keep_largest_inplace(local_data_vec.data(), local_n,
-                                            neighbor_data_vec.data(), neighbor_n,
-                                            merge_buf.data(), local_n);
-            }
+        // 合併資料
+        if (i_am_left) {
+            merge_keep_smallest_inplace(local_data_vec.data(), local_n,
+                                        neighbor_data_vec.data(), neighbor_n,
+                                        merge_buf.data(), local_n);
+        } else {
+            merge_keep_largest_inplace(local_data_vec.data(), local_n,
+                                    neighbor_data_vec.data(), neighbor_n,
+                                    merge_buf.data(), local_n);
         }
-    }
+        std::swap(local_data_vec, merge_buf);
+    } // end for phase
 
     nvtxRangePop(); nvtxRangePush("IO");
     MPI_File_open(MPI_COMM_SELF, outfile, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh);
