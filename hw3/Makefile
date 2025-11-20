@@ -3,7 +3,7 @@ CXX = g++
 NVCC = nvcc
 HIPCC = hipcc
 
-NVFLAGS = -std=c++11 -O3 -Xptxas="-v" -arch=sm_61 
+NVFLAGS = -std=c++11 -O3 -Xptxas="-v" -arch=sm_61
 HIPCCFLAGS = -std=c++11 -O3 --offload-arch=gfx908
 
 LDFLAGS = -lm
