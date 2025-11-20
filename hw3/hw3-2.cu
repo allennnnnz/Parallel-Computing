@@ -21,37 +21,41 @@
 
 // Phase 1: pivot block (r, r)
 // 這裡用「單一 thread」在 GPU 上順序跑完 B×B 的 FW，確保正確性
-__global__ void phase1(
-    int* Dist,
-    int  nPad,
-    int  B,
-    int  r
-){
-    if (threadIdx.x != 0 || threadIdx.y != 0 ||
-        blockIdx.x  != 0 || blockIdx.y  != 0) return;
+__global__ void phase1(int* Dist, int nPad, int B, int r)
+{
+    int ti = threadIdx.y;     // 0..B-1
+    int tj = threadIdx.x;     // 0..B-1
 
-    int i0 = r * B;
-    int j0 = r * B;
-    int k_start = r * B;
-    int k_end   = k_start + B;  // nPad 已是 B 的倍數，不會越界
+    int gi = r * B + ti;
+    int gj = r * B + tj;
 
-    for (int k = k_start; k < k_end; ++k) {
-        for (int i = i0; i < i0 + B; ++i) {
-            for (int j = j0; j < j0 + B; ++j) {
+    __shared__ int pivot[32 * 32];    // 1D shared buffer
 
-                int idx_ik = i * nPad + k;
-                int idx_kj = k * nPad + j;
-                int idx_ij = i * nPad + j;
+    int local_idx = ti * B + tj;
 
-                int w1 = Dist[idx_ik];
-                int w2 = Dist[idx_kj];
-                if (w1 == INF || w2 == INF) continue;
-                int via = w1 + w2;
-                if (via < Dist[idx_ij])
-                    Dist[idx_ij] = via;
-            }
-        }
+    // load pivot block
+    pivot[local_idx] = Dist[gi * nPad + gj];
+
+    __syncthreads();
+
+    // k-loop inside pivot block (local k = 0..B-1)
+    for (int k = 0; k < B; k++)
+    {
+        int w1 = pivot[ti * B + k];  // pivot(i,k)
+        int w2 = pivot[k * B + tj];  // pivot(k,j)
+
+        int via = (w1 == INF || w2 == INF) ? INF : (w1 + w2);
+
+        
+
+        if (via < pivot[local_idx])
+            pivot[local_idx] = via;
+
+        __syncthreads(); // wait all threads update pivot
     }
+
+    // write back
+    Dist[gi * nPad + gj] = pivot[local_idx];
 }
 
 // Phase 2: pivot row & pivot column blocks
@@ -62,47 +66,66 @@ __global__ void phase2(
     int* Dist,
     int  nPad,
     int  B,
-    int  r,           // current round index
-    int  numBlocks    // nPad / B
+    int  r,
+    int  numBlocks
 ){
-    int which = blockIdx.y;   // 0: row (r, j)  1: col (i, r)
+    int ti = threadIdx.y;
+    int tj = threadIdx.x;
+    int local = ti * B + tj;
 
-    // blockIdx.x ∈ [0, numBlocks-2]，映射成跳過 r 的 block index
+    // ---- shared memory: two tiles (rowPart & colPart) ----
+    __shared__ int tileA[32*32]; // my block
+    __shared__ int tileB[32*32]; // pivot row / pivot col block
+
+    int which = blockIdx.y;  // 0=row, 1=col
     int t = blockIdx.x;
-    int coord = (t < r) ? t : t + 1;   // coord ∈ [0, numBlocks-1], coord != r
+    int coord = (t < r) ? t : t + 1;
 
-    int block_i, block_j;
+    int bi = (which == 0 ? r : coord);
+    int bj = (which == 0 ? coord : r);
+
+    int gi = bi * B + ti;
+    int gj = bj * B + tj;
+
+    // ---- 1. load my block into shared memory ----
+    tileA[local] = Dist[gi * nPad + gj];
+
+    // ---- 2. load needed pivot row/col block into tileB ----
     if (which == 0) {
-        // pivot row: (r, coord)
-        block_i = r;
-        block_j = coord;
+        // row block: we need pivot row block (r, r)
+        tileB[local] = Dist[(r * B + ti) * nPad + (r * B + tj)];
     } else {
-        // pivot column: (coord, r)
-        block_i = coord;
-        block_j = r;
+        // col block: we need pivot col block (r, r)
+        tileB[local] = Dist[(r * B + ti) * nPad + (r * B + tj)];
     }
 
-    int block_start_x = block_i * B;
-    int block_start_y = block_j * B;
+    __syncthreads();
 
-    int i = block_start_x + threadIdx.y;
-    int j = block_start_y + threadIdx.x;
+    // ---- 3. Do k-loop fully in shared memory ----
+    for (int k = 0; k < B; k++)
+    {
+        int w1, w2;
 
-    int k_start = r * B;
-    int k_end   = k_start + B;
+        if (which == 0) {   
+            // (r, j) = pivotRow[i][k], selfBlock[k][j]
+            w1 = tileB[ti * B + k];
+            w2 = tileA[k * B + tj];
+        } else {            
+            // (i, r) = selfBlock[i][k], pivotCol[k][j]
+            w1 = tileA[ti * B + k];
+            w2 = tileB[k * B + tj];
+        }
 
-    for (int k = k_start; k < k_end; ++k) {
-        int idx_ik = i * nPad + k;
-        int idx_kj = k * nPad + j;
-        int idx_ij = i * nPad + j;
+        int via = (w1 == INF || w2 == INF ? INF : (w1 + w2));
 
-        int w1 = Dist[idx_ik];
-        int w2 = Dist[idx_kj];
-        if (w1 == INF || w2 == INF) continue;
-        int via = w1 + w2;
-        if (via < Dist[idx_ij])
-            Dist[idx_ij] = via;
+        if (via < tileA[local])
+            tileA[local] = via;
+
+        __syncthreads();
     }
+
+    // ---- 4. write back ----
+    Dist[gi * nPad + gj] = tileA[local];
 }
 
 // Phase 3: other blocks (neither in row r nor col r)
@@ -114,6 +137,9 @@ __global__ void phase3(
     int  r,
     int  numBlocks
 ){
+    int ti = threadIdx.y;  // 0..B-1
+    int tj = threadIdx.x;  // 0..B-1
+
     int block_i = blockIdx.y;
     int block_j = blockIdx.x;
 
@@ -121,27 +147,48 @@ __global__ void phase3(
     if (block_i == r || block_j == r)
         return;
 
-    int block_start_x = block_i * B;
-    int block_start_y = block_j * B;
+    // global index of this tile
+    int gi = block_i * B + ti;
+    int gj = block_j * B + tj;
 
-    int i = block_start_x + threadIdx.y;
-    int j = block_start_y + threadIdx.x;
+    // pivot-row tile = (r, block_j)
+    int pri = r * B + ti;
+    int prj = block_j * B + tj;
 
-    int k_start = r * B;
-    int k_end   = k_start + B;
+    // pivot-col tile = (block_i, r)
+    int pci = block_i * B + ti;
+    int pcj = r * B + tj;
 
-    for (int k = k_start; k < k_end; ++k) {
-        int idx_ik = i * nPad + k;
-        int idx_kj = k * nPad + j;
-        int idx_ij = i * nPad + j;
+    // ---------- shared memory ------------
+    __shared__ int tile[32 * 32];      // current block
+    __shared__ int pivotRow[32 * 32];  // block (r, j)
+    __shared__ int pivotCol[32 * 32];  // block (i, r)
 
-        int w1 = Dist[idx_ik];
-        int w2 = Dist[idx_kj];
-        if (w1 == INF || w2 == INF) continue;
-        int via = w1 + w2;
-        if (via < Dist[idx_ij])
-            Dist[idx_ij] = via;
+    int lid = ti * B + tj;
+
+    // load three tiles
+    tile[lid]     = Dist[gi * nPad + gj];
+    pivotRow[lid] = Dist[pri * nPad + prj];
+    pivotCol[lid] = Dist[pci * nPad + pcj];
+
+    __syncthreads();
+
+    // local k loop (0..B-1)
+    for (int k = 0; k < B; k++)
+    {
+        int w1 = pivotCol[ti * B + k];   // Dist[i][k]
+        int w2 = pivotRow[k * B + tj];   // Dist[k][j]
+
+        int via = (w1 == INF || w2 == INF ? INF : w1 + w2);
+
+        if (via < tile[lid])
+            tile[lid] = via;
+
+        __syncthreads();
     }
+
+    // write back final result
+    Dist[gi * nPad + gj] = tile[lid];
 }
 
 
@@ -170,6 +217,7 @@ void input(char* infile, int B, int** Dist_ptr, int* n_ptr, int* nPad_ptr){
     }
 
     // 初始化：對角線 0，其餘 INF，padding 區也 INF
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i < nPad; ++i) {
         for (int j = 0; j < nPad; ++j) {
             if (i < n && j < n) {
@@ -182,6 +230,7 @@ void input(char* infile, int B, int** Dist_ptr, int* n_ptr, int* nPad_ptr){
 
     // 讀邊
     int edge[3];
+    #pragma omp parallel for
     for (int i = 0; i < m; ++i) {
         fread(edge, sizeof(int), 3, file);
         int u = edge[0], v = edge[1], w = edge[2];
@@ -198,6 +247,7 @@ void output(char* outfile, int* Dist, int n, int nPad){
         perror("fopen output");
         exit(1);
     }
+    #pragma omp parallel for
     for (int i = 0; i < n; ++i) {
         fwrite(&Dist[i*nPad], sizeof(int), n, out);
     }
@@ -227,31 +277,28 @@ void block_FW_CUDA(int* Dist, int n, int nPad, int B){
 
     for (int r = 0; r < rounds; ++r) {
         // ===== Phase 1: pivot block (r,r) =====
-        {
-            dim3 gridPhase1(1, 1);
-            phase1<<<gridPhase1, dim3(1,1)>>>(Dist_d, nPad, B, r);
-            CUDA_CHECK( cudaDeviceSynchronize() );
-        }
+        dim3 gridPhase1(1, 1);
+        phase1<<<gridPhase1, blockDim>>>(Dist_d, nPad, B, r);
+            
 
         // ===== Phase 2: pivot row & column =====
-        {
-            dim3 gridPhase2(rounds - 1, 2); // x: 0..rounds-2, y: 0(row)/1(col)
-            phase2<<<gridPhase2, blockDim>>>(Dist_d, nPad, B, r, rounds);
-            CUDA_CHECK( cudaDeviceSynchronize() );
-        }
+
+        dim3 gridPhase2(rounds - 1, 2);   // x = all blocks except r, y = 0(row),1(col)
+        dim3 threadsPhase2(B, B);
+
+        phase2<<<gridPhase2, threadsPhase2>>>(Dist_d, nPad, B, r, rounds);
+
 
         // ===== Phase 3: remaining blocks =====
-        {
-            dim3 gridPhase3(rounds, rounds);
-            phase3<<<gridPhase3, blockDim>>>(Dist_d, nPad, B, r, rounds);
-            CUDA_CHECK( cudaDeviceSynchronize() );
-        }
+
+        dim3 gridPhase3(rounds, rounds);
+        phase3<<<gridPhase3, blockDim>>>(Dist_d, nPad, B, r, rounds);
     }
 
-    CUDA_CHECK( cudaMemcpy(Dist, Dist_d,
+    cudaMemcpy(Dist, Dist_d,
                            nPad*nPad*sizeof(int),
-                           cudaMemcpyDeviceToHost) );
-    CUDA_CHECK( cudaFree(Dist_d) );
+                           cudaMemcpyDeviceToHost);
+    cudaFree(Dist_d);
 }
 
 
