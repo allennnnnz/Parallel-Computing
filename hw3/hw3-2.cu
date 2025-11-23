@@ -34,31 +34,32 @@ __global__ void phase1(int* Dist, int nPad, int B, int r)
     int col0 = r * B + off_j;
     int col1 = col0 + 1;
 
-    __shared__ int pivot[64 * 64];
+    const int STRIDE = B + 1; // shared padding stride to avoid 32-bank conflicts
+    __shared__ int pivot[64 * (64 + 1)];
 
     // 載入四元素 (所有 threads 合作載完整 64x64)
-    if (row0 < nPad && col0 < nPad) pivot[off_i * B + off_j] = Dist[row0 * nPad + col0];
-    if (row0 < nPad && col1 < nPad) pivot[off_i * B + off_j + 1] = Dist[row0 * nPad + col1];
-    if (row1 < nPad && col0 < nPad) pivot[(off_i + 1) * B + off_j] = Dist[row1 * nPad + col0];
-    if (row1 < nPad && col1 < nPad) pivot[(off_i + 1) * B + off_j + 1] = Dist[row1 * nPad + col1];
+    if (row0 < nPad && col0 < nPad) pivot[off_i * STRIDE + off_j] = Dist[row0 * nPad + col0];
+    if (row0 < nPad && col1 < nPad) pivot[off_i * STRIDE + off_j + 1] = Dist[row0 * nPad + col1];
+    if (row1 < nPad && col0 < nPad) pivot[(off_i + 1) * STRIDE + off_j] = Dist[row1 * nPad + col0];
+    if (row1 < nPad && col1 < nPad) pivot[(off_i + 1) * STRIDE + off_j + 1] = Dist[row1 * nPad + col1];
 
     __syncthreads();
 
     for (int k = 0; k < B; ++k) {
-        int r0k = pivot[off_i * B + k];
-        int r1k = pivot[(off_i + 1) * B + k];
-        int kc0 = pivot[k * B + off_j];
-        int kc1 = pivot[k * B + off_j + 1];
+        int r0k = pivot[off_i * STRIDE + k];
+        int r1k = pivot[(off_i + 1) * STRIDE + k];
+        int kc0 = pivot[k * STRIDE + off_j];
+        int kc1 = pivot[k * STRIDE + off_j + 1];
 
         int via00 = (r0k == INF || kc0 == INF) ? INF : r0k + kc0;
         int via01 = (r0k == INF || kc1 == INF) ? INF : r0k + kc1;
         int via10 = (r1k == INF || kc0 == INF) ? INF : r1k + kc0;
         int via11 = (r1k == INF || kc1 == INF) ? INF : r1k + kc1;
 
-        int idx00 = off_i * B + off_j;
-        int idx01 = off_i * B + off_j + 1;
-        int idx10 = (off_i + 1) * B + off_j;
-        int idx11 = (off_i + 1) * B + off_j + 1;
+        int idx00 = off_i * STRIDE + off_j;
+        int idx01 = off_i * STRIDE + off_j + 1;
+        int idx10 = (off_i + 1) * STRIDE + off_j;
+        int idx11 = (off_i + 1) * STRIDE + off_j + 1;
 
         if (via00 < pivot[idx00]) pivot[idx00] = via00;
         if (via01 < pivot[idx01]) pivot[idx01] = via01;
@@ -68,10 +69,10 @@ __global__ void phase1(int* Dist, int nPad, int B, int r)
         __syncthreads();
     }
 
-    if (row0 < nPad && col0 < nPad) Dist[row0 * nPad + col0] = pivot[off_i * B + off_j];
-    if (row0 < nPad && col1 < nPad) Dist[row0 * nPad + col1] = pivot[off_i * B + off_j + 1];
-    if (row1 < nPad && col0 < nPad) Dist[row1 * nPad + col0] = pivot[(off_i + 1) * B + off_j];
-    if (row1 < nPad && col1 < nPad) Dist[row1 * nPad + col1] = pivot[(off_i + 1) * B + off_j + 1];
+    if (row0 < nPad && col0 < nPad) Dist[row0 * nPad + col0] = pivot[off_i * STRIDE + off_j];
+    if (row0 < nPad && col1 < nPad) Dist[row0 * nPad + col1] = pivot[off_i * STRIDE + off_j + 1];
+    if (row1 < nPad && col0 < nPad) Dist[row1 * nPad + col0] = pivot[(off_i + 1) * STRIDE + off_j];
+    if (row1 < nPad && col1 < nPad) Dist[row1 * nPad + col1] = pivot[(off_i + 1) * STRIDE + off_j + 1];
 }
 
 // Phase 2: pivot row & pivot column blocks
@@ -90,8 +91,9 @@ __global__ void phase2(
     int off_i = (tyi << 1);
     int off_j = (txj << 1);
 
-    __shared__ int tileA[64 * 64];
-    __shared__ int tileB[64 * 64];
+    const int STRIDE2 = B + 1;
+    __shared__ int tileA[64 * (64 + 1)];
+    __shared__ int tileB[64 * (64 + 1)];
 
     int which = blockIdx.y; // 0=row, 1=col
     int t = blockIdx.x;
@@ -108,7 +110,7 @@ __global__ void phase2(
             int gi = base_i + di;
             int gj = base_j + dj;
             if (gi < nPad && gj < nPad)
-                tileA[(off_i + di) * B + (off_j + dj)] = Dist[gi * nPad + gj];
+                tileA[(off_i + di) * STRIDE2 + (off_j + dj)] = Dist[gi * nPad + gj];
         }
     }
     // load pivot block (r,r) into tileB
@@ -117,7 +119,7 @@ __global__ void phase2(
             int gi = r * B + off_i + di;
             int gj = r * B + off_j + dj;
             if (gi < nPad && gj < nPad)
-                tileB[(off_i + di) * B + (off_j + dj)] = Dist[gi * nPad + gj];
+                tileB[(off_i + di) * STRIDE2 + (off_j + dj)] = Dist[gi * nPad + gj];
         }
     }
 
@@ -126,12 +128,12 @@ __global__ void phase2(
     for (int k = 0; k < B; ++k) {
         for (int di = 0; di < 2; ++di) {
             int rowLocal = off_i + di;
-            int pivot_i_k = (which == 0) ? tileB[rowLocal * B + k] : tileA[rowLocal * B + k];
+            int pivot_i_k = (which == 0) ? tileB[rowLocal * STRIDE2 + k] : tileA[rowLocal * STRIDE2 + k];
             for (int dj = 0; dj < 2; ++dj) {
                 int colLocal = off_j + dj;
-                int other_k_j = (which == 0) ? tileA[k * B + colLocal] : tileB[k * B + colLocal];
+                int other_k_j = (which == 0) ? tileA[k * STRIDE2 + colLocal] : tileB[k * STRIDE2 + colLocal];
                 int via = (pivot_i_k == INF || other_k_j == INF) ? INF : (pivot_i_k + other_k_j);
-                int idx = rowLocal * B + colLocal;
+                int idx = rowLocal * STRIDE2 + colLocal;
                 if (via < tileA[idx]) tileA[idx] = via;
             }
         }
@@ -143,7 +145,7 @@ __global__ void phase2(
             int gi = base_i + di;
             int gj = base_j + dj;
             if (gi < nPad && gj < nPad)
-                Dist[gi * nPad + gj] = tileA[(off_i + di) * B + (off_j + dj)];
+                Dist[gi * nPad + gj] = tileA[(off_i + di) * STRIDE2 + (off_j + dj)];
         }
     }
 }
@@ -157,66 +159,76 @@ __global__ void phase3(
     int  r,
     int  numBlocks
 ){
-    int tyi = threadIdx.y; // 0..31
-    int txj = threadIdx.x; // 0..31
-    int off_i = (tyi << 1);
-    int off_j = (txj << 1);
+    int li = threadIdx.y; // 0..31
+    int lj = threadIdx.x; // 0..31
 
     int block_i = blockIdx.y;
     int block_j = blockIdx.x;
     if (block_i == r || block_j == r) return;
 
-    __shared__ int tile[64 * 64];
-    __shared__ int pivotRow[64 * 64];
-    __shared__ int pivotCol[64 * 64];
+    const int STRIDE3 = B + 1;
+    __shared__ int tile[64 * (64 + 1)];
+    // 使用兩個小向量保存當前 k 的 pivot row/col，避免大 shared 陣列
+    __shared__ int rowK[64 + 1];
+    __shared__ int colK[64 + 1];
 
-    int base_i = block_i * B + off_i;
-    int base_j = block_j * B + off_j;
-    int pivot_row_base_i = r * B + off_i;
-    int pivot_row_base_j = block_j * B + off_j;
-    int pivot_col_base_i = block_i * B + off_i;
-    int pivot_col_base_j = r * B + off_j;
+    int base_i0 = block_i * B;  // block 起始 row
+    int base_j0 = block_j * B;  // block 起始 col
 
-    for (int di = 0; di < 2; ++di) {
-        for (int dj = 0; dj < 2; ++dj) {
-            int gi = base_i + di;
-            int gj = base_j + dj;
+    // 以 4 個 32x32 子區塊載入 tile，確保 warp 內連續欄位存取避免 bank conflict
+    for (int ib = 0; ib < B; ib += 32) {
+        for (int jb = 0; jb < B; jb += 32) {
+            int gi = base_i0 + ib + li;
+            int gj = base_j0 + jb + lj;
             if (gi < nPad && gj < nPad)
-                tile[(off_i + di) * B + (off_j + dj)] = Dist[gi * nPad + gj];
-            int pri = pivot_row_base_i + di;
-            int prj = pivot_row_base_j + dj;
-            if (pri < nPad && prj < nPad)
-                pivotRow[(off_i + di) * B + (off_j + dj)] = Dist[pri * nPad + prj];
-            int pci = pivot_col_base_i + di;
-            int pcj = pivot_col_base_j + dj;
-            if (pci < nPad && pcj < nPad)
-                pivotCol[(off_i + di) * B + (off_j + dj)] = Dist[pci * nPad + pcj];
+                tile[(ib + li) * STRIDE3 + (jb + lj)] = Dist[gi * nPad + gj];
         }
     }
 
     __syncthreads();
 
+    // 逐 k 更新
     for (int k = 0; k < B; ++k) {
-        for (int di = 0; di < 2; ++di) {
-            int rowLocal = off_i + di;
-            int w1 = pivotCol[rowLocal * B + k];
-            for (int dj = 0; dj < 2; ++dj) {
-                int colLocal = off_j + dj;
-                int w2 = pivotRow[k * B + colLocal];
+        // 僅使用 y=0 與 y=1 兩個 warps 連續載入 64 個元素，避免 stride-2 的 2-way 衝突
+        if (li < 2) {
+            int idx = lj + (li << 5); // 0..63
+            int grow = r * B + k;
+            int gcol = base_j0 + idx;
+            if (grow < nPad && gcol < nPad)
+                rowK[idx] = Dist[grow * nPad + gcol];
+        }
+        if (li < 2) {
+            int idx = lj + (li << 5); // 0..63
+            int grow = base_i0 + idx;
+            int gcol = r * B + k;
+            if (grow < nPad && gcol < nPad)
+                colK[idx] = Dist[grow * nPad + gcol];
+        }
+
+        __syncthreads();
+
+        // 使用 rowK/colK 更新 tile，同樣以 32x32 子區塊方式避免 bank conflict
+        for (int ib = 0; ib < B; ib += 32) {
+            int rowLocal = ib + li;     // warp 內相同 → broadcast 讀 colK
+            int w1 = colK[rowLocal];
+            for (int jb = 0; jb < B; jb += 32) {
+                int colLocal = jb + lj; // warp 內連續 → 避免衝突
+                int w2 = rowK[colLocal];
                 int via = (w1 == INF || w2 == INF) ? INF : (w1 + w2);
-                int idx = rowLocal * B + colLocal;
-                if (via < tile[idx]) tile[idx] = via;
+                int sidx = rowLocal * STRIDE3 + colLocal;
+                if (via < tile[sidx]) tile[sidx] = via;
             }
         }
         __syncthreads();
     }
 
-    for (int di = 0; di < 2; ++di) {
-        for (int dj = 0; dj < 2; ++dj) {
-            int gi = base_i + di;
-            int gj = base_j + dj;
+    // 回寫結果，同樣以 32x32 子區塊避免衝突
+    for (int ib = 0; ib < B; ib += 32) {
+        for (int jb = 0; jb < B; jb += 32) {
+            int gi = base_i0 + ib + li;
+            int gj = base_j0 + jb + lj;
             if (gi < nPad && gj < nPad)
-                Dist[gi * nPad + gj] = tile[(off_i + di) * B + (off_j + dj)];
+                Dist[gi * nPad + gj] = tile[(ib + li) * STRIDE3 + (jb + lj)];
         }
     }
 }
