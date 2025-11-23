@@ -126,45 +126,57 @@ __global__ void phase3(
     int k_start = r * B;
     int k_end   = k_start + B;
 
-    // 2×2 per thread
+    // 2×2 per thread coordinates
     int i0 = block_start_x + (threadIdx.y << 1);
     int j0 = block_start_y + (threadIdx.x << 1);
 
     if (i0 >= block_start_x + B || j0 >= block_start_y + B)
         return;
 
-    // preload Dij values
+    // ---- shared memory for pivot row and column ----
+    __shared__ int pivotRow[32][33];
+    __shared__ int pivotCol[32][33];
+
+    // load pivot row & col into shared memory
+    // reuse same 2×2 thread tiling
+    for (int kk = threadIdx.y; kk < B; kk += blockDim.y) {
+        for (int jj = threadIdx.x; jj < B; jj += blockDim.x) {
+            pivotRow[kk][jj] = Dist[ (k_start + kk) * nPad + (block_start_y + jj) ];
+            pivotCol[kk][jj] = Dist[ (block_start_x + jj) * nPad + (k_start + kk) ];
+        }
+    }
+    __syncthreads();
+
+    // preload 2×2 tile outputs
     int idx00 = i0 * nPad + j0;
     int d00 = Dist[idx00];
-
     int idx01 = idx00 + 1;
     int d01 = Dist[idx01];
-
     int idx10 = idx00 + nPad;
     int d10 = Dist[idx10];
-
     int idx11 = idx10 + 1;
     int d11 = Dist[idx11];
 
-    for (int k = k_start; k < k_end; ++k) {
+    // ----- compute using shared pivot row & col -----
+    for (int kk = 0; kk < B; ++kk) {
 
-        int dik0 = Dist[i0 * nPad + k];
-        int dik1 = Dist[(i0+1) * nPad + k];
+        int dik0 = pivotCol[kk][i0 - block_start_x];
+        int dik1 = pivotCol[kk][(i0+1) - block_start_x];
 
-        int dkj0 = Dist[k * nPad + j0];
-        int dkj1 = Dist[k * nPad + j0 + 1];
+        int dkj0 = pivotRow[kk][j0 - block_start_y];
+        int dkj1 = pivotRow[kk][(j0+1) - block_start_y];
 
         if (dik0 != INF) {
             if (dkj0 != INF) d00 = min(d00, dik0 + dkj0);
             if (dkj1 != INF) d01 = min(d01, dik0 + dkj1);
         }
-
         if (dik1 != INF) {
             if (dkj0 != INF) d10 = min(d10, dik1 + dkj0);
             if (dkj1 != INF) d11 = min(d11, dik1 + dkj1);
         }
     }
 
+    // write back
     Dist[idx00] = d00;
     Dist[idx01] = d01;
     Dist[idx10] = d10;
