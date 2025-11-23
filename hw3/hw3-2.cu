@@ -269,11 +269,8 @@ void input(char* infile, int B, int** Dist_ptr, int* n_ptr, int* nPad_ptr){
     int nPad = ((n + B - 1) / B) * B;
     *nPad_ptr = nPad;
 
-    int* Dist = (int*)malloc(nPad * nPad * sizeof(int));
-    if (!Dist) {
-        fprintf(stderr, "malloc Dist failed\n");
-        exit(1);
-    }
+    int* Dist = NULL;
+    CUDA_CHECK( cudaMallocHost((void**)&Dist, nPad * nPad * sizeof(int)) ); // pinned host memory
 
     // 初始化：對角線 0，其餘 INF，padding 區也 INF
     #pragma omp parallel for collapse(2)
@@ -379,6 +376,6 @@ int main(int argc, char** argv){
     block_FW_CUDA(Dist, n, nPad, B);
     output(argv[2], Dist, n, nPad);
 
-    free(Dist);
+    CUDA_CHECK( cudaFreeHost(Dist) );
     return 0;
 }
