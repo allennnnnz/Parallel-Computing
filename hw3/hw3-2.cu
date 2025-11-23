@@ -153,82 +153,99 @@ __global__ void phase2(
 // Phase 3: other blocks (neither in row r nor col r)
 // gridDim = (numBlocks, numBlocks)
 __global__ void phase3(
-    int* Dist,
+    int* __restrict__ Dist,
     int  nPad,
     int  B,
     int  r,
     int  numBlocks
 ){
-    int li = threadIdx.y; // 0..31
-    int lj = threadIdx.x; // 0..31
+    // threadIdx.x 對應 column 快變，threadIdx.y 對應 row 慢變
+    int ty = threadIdx.y; // 0..31
+    int tx = threadIdx.x; // 0..31
 
     int block_i = blockIdx.y;
     int block_j = blockIdx.x;
-    if (block_i == r || block_j == r) return;
+    if (block_i == r || block_j == r) return; // phase3 只處理非 pivot row/col blocks
 
-    const int STRIDE3 = B + 1;
-    __shared__ int tile[64 * (64 + 1)];
-    // 使用兩個小向量保存當前 k 的 pivot row/col，避免大 shared 陣列
-    __shared__ int rowK[64 + 1];
-    __shared__ int colK[64 + 1];
+    // Shared padding stride 以避免 bank conflict（tile 使用 B+1）；其餘切片陣列因維度較小可不 padding 或輕度 padding
+    const int STRIDE_TILE = B + 1; // 65
+    // k 切片大小，使用 32 可讓一個 warp 讀滿 32 連續 k columns / rows
+    const int SLICE_K = 32; // 需整除 B=64
 
-    int base_i0 = block_i * B;  // block 起始 row
-    int base_j0 = block_j * B;  // block 起始 col
+    __shared__ int tile[64 * (64 + 1)];          // 64x64 tile (padded stride 65)
+    __shared__ int pivotRowSlice[SLICE_K][64];   // Dist[r*B + k][base_j0 + col]
+    __shared__ int pivotColSlice[64][SLICE_K];   // Dist[base_i0 + row][r*B + k]
 
-    // 以 4 個 32x32 子區塊載入 tile，確保 warp 內連續欄位存取避免 bank conflict
+    int base_i0 = block_i * B; // block 起始 row (global)
+    int base_j0 = block_j * B; // block 起始 col (global)
+
+    // 載入 64x64 block tile -> shared (分 4 個 32x32 子區塊，確保 row 固定、col 連續 => coalesced)
     for (int ib = 0; ib < B; ib += 32) {
+        int gi = base_i0 + ib + ty; // row
         for (int jb = 0; jb < B; jb += 32) {
-            int gi = base_i0 + ib + li;
-            int gj = base_j0 + jb + lj;
+            int gj = base_j0 + jb + tx; // col
             if (gi < nPad && gj < nPad)
-                tile[(ib + li) * STRIDE3 + (jb + lj)] = Dist[gi * nPad + gj];
+                tile[(ib + ty) * STRIDE_TILE + (jb + tx)] = Dist[gi * nPad + gj];
         }
     }
 
     __syncthreads();
 
-    // 逐 k 更新
-    for (int k = 0; k < B; ++k) {
-        // 僅使用 y=0 與 y=1 兩個 warps 連續載入 64 個元素，避免 stride-2 的 2-way 衝突
-        if (li < 2) {
-            int idx = lj + (li << 5); // 0..63
-            int grow = r * B + k;
-            int gcol = base_j0 + idx;
-            if (grow < nPad && gcol < nPad)
-                rowK[idx] = Dist[grow * nPad + gcol];
-        }
-        if (li < 2) {
-            int idx = lj + (li << 5); // 0..63
-            int grow = base_i0 + idx;
-            int gcol = r * B + k;
-            if (grow < nPad && gcol < nPad)
-                colK[idx] = Dist[grow * nPad + gcol];
+    // 以 k 切片 (32) 方式載入 pivot row/column；每個切片只同步一次
+    for (int kBase = 0; kBase < B; kBase += SLICE_K) {
+        __syncthreads(); // 保證上一片計算完成，安全覆寫 slice 緩衝
+
+        // 1) 共同載入 pivot row slice: [SLICE_K x 64]
+        // prow = r*B + (kBase + ty)，每個 ty 對應一個 kLocal，tx 連續覆蓋 64 欄（分兩段 32）
+        for (int cb = 0; cb < B; cb += 32) {
+            int prow = r * B + kBase + ty;
+            int gj = base_j0 + cb + tx;
+            int v = (prow < nPad && gj < nPad) ? Dist[prow * nPad + gj] : INF;
+            pivotRowSlice[ty][cb + tx] = v;
         }
 
-        __syncthreads();
+        // 2) 共同載入 pivot column slice: [64 x SLICE_K]
+        // grow = base_i0 + (rb + ty)，tx 對應 kLocal，row 固定、kLocal 連續（行內連續讀）
+        for (int rb = 0; rb < B; rb += 32) {
+            int grow = base_i0 + rb + ty;
+            int pcol = r * B + kBase + tx;
+            int v = (grow < nPad && pcol < nPad) ? Dist[grow * nPad + pcol] : INF;
+            pivotColSlice[rb + ty][tx] = v;
+        }
 
-        // 使用 rowK/colK 更新 tile，同樣以 32x32 子區塊方式避免 bank conflict
+        __syncthreads(); // 確保整片 slice 可見
+
+        // 3) 計算：對切片內所有 kLocal 進行累積更新；每個 thread 專責一個輸出元素，無需片內同步
         for (int ib = 0; ib < B; ib += 32) {
-            int rowLocal = ib + li;     // warp 內相同 → broadcast 讀 colK
-            int w1 = colK[rowLocal];
+            int rowLocal = ib + ty; // 0..63
+            int gi = base_i0 + rowLocal;
             for (int jb = 0; jb < B; jb += 32) {
-                int colLocal = jb + lj; // warp 內連續 → 避免衝突
-                int w2 = rowK[colLocal];
-                int via = (w1 == INF || w2 == INF) ? INF : (w1 + w2);
-                int sidx = rowLocal * STRIDE3 + colLocal;
-                if (via < tile[sidx]) tile[sidx] = via;
+                int colLocal = jb + tx; // 0..63
+                int gj = base_j0 + colLocal;
+                if (gi < nPad && gj < nPad) {
+                    int sidx = rowLocal * STRIDE_TILE + colLocal;
+                    int best = tile[sidx];
+                    #pragma unroll
+                    for (int kLocal = 0; kLocal < SLICE_K; ++kLocal) {
+                        int w1 = pivotColSlice[rowLocal][kLocal]; // Dist[i][k]
+                        int w2 = pivotRowSlice[kLocal][colLocal]; // Dist[k][j]
+                        int via = (w1 == INF || w2 == INF) ? INF : (w1 + w2);
+                        if (via < best) best = via;
+                    }
+                    tile[sidx] = best;
+                }
             }
         }
-        __syncthreads();
+        // 下一片的載入前會再以 __syncthreads 做邊界同步
     }
 
-    // 回寫結果，同樣以 32x32 子區塊避免衝突
+    // 回寫 tile 至 Dist（row 固定，col 連續 => coalesced）
     for (int ib = 0; ib < B; ib += 32) {
+        int gi = base_i0 + ib + ty;
         for (int jb = 0; jb < B; jb += 32) {
-            int gi = base_i0 + ib + li;
-            int gj = base_j0 + jb + lj;
+            int gj = base_j0 + jb + tx;
             if (gi < nPad && gj < nPad)
-                Dist[gi * nPad + gj] = tile[(ib + li) * STRIDE3 + (jb + lj)];
+                Dist[gi * nPad + gj] = tile[(ib + ty) * STRIDE_TILE + (jb + tx)];
         }
     }
 }
