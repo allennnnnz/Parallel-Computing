@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 
+
 #define INF 1073741823  // (1<<30)-1
 
 // 簡單的 CUDA error check macro
@@ -20,38 +21,58 @@
 // ======================================================
 
 // Phase 1: pivot block (r, r)
-// 這裡用「單一 thread」在 GPU 上順序跑完 B×B 的 FW，確保正確性
-__global__ void phase1(
-    int* Dist,
-    int  nPad,
-    int  B,
-    int  r
-){
-    if (threadIdx.x != 0 || threadIdx.y != 0 ||
-        blockIdx.x  != 0 || blockIdx.y  != 0) return;
+// 改成 64x64 tile 使用 32x32 threads；每 thread 處理 2x2 微分塊 (4 元素)
+__global__ void phase1(int* Dist, int nPad, int B, int r)
+{
+    int tyi = threadIdx.y; // 0..31
+    int txj = threadIdx.x; // 0..31
+    int off_i = (tyi << 1); // local row start (0..62 step 2)
+    int off_j = (txj << 1); // local col start (0..62 step 2)
 
-    int i0 = r * B;
-    int j0 = r * B;
-    int k_start = r * B;
-    int k_end   = k_start + B;  // nPad 已是 B 的倍數，不會越界
+    int row0 = r * B + off_i;
+    int row1 = row0 + 1;
+    int col0 = r * B + off_j;
+    int col1 = col0 + 1;
 
-    for (int k = k_start; k < k_end; ++k) {
-        for (int i = i0; i < i0 + B; ++i) {
-            for (int j = j0; j < j0 + B; ++j) {
+    const int STRIDE = B + 1; // shared padding stride to avoid 32-bank conflicts
+    __shared__ int pivot[64 * (64 + 1)];
 
-                int idx_ik = i * nPad + k;
-                int idx_kj = k * nPad + j;
-                int idx_ij = i * nPad + j;
+    // 載入四元素 (所有 threads 合作載完整 64x64)
+    if (row0 < nPad && col0 < nPad) pivot[off_i * STRIDE + off_j] = Dist[row0 * nPad + col0];
+    if (row0 < nPad && col1 < nPad) pivot[off_i * STRIDE + off_j + 1] = Dist[row0 * nPad + col1];
+    if (row1 < nPad && col0 < nPad) pivot[(off_i + 1) * STRIDE + off_j] = Dist[row1 * nPad + col0];
+    if (row1 < nPad && col1 < nPad) pivot[(off_i + 1) * STRIDE + off_j + 1] = Dist[row1 * nPad + col1];
 
-                int w1 = Dist[idx_ik];
-                int w2 = Dist[idx_kj];
-                if (w1 == INF || w2 == INF) continue;
-                int via = w1 + w2;
-                if (via < Dist[idx_ij])
-                    Dist[idx_ij] = via;
-            }
-        }
+    __syncthreads();
+
+    for (int k = 0; k < B; ++k) {
+        int r0k = pivot[off_i * STRIDE + k];
+        int r1k = pivot[(off_i + 1) * STRIDE + k];
+        int kc0 = pivot[k * STRIDE + off_j];
+        int kc1 = pivot[k * STRIDE + off_j + 1];
+
+        int via00 = (r0k == INF || kc0 == INF) ? INF : r0k + kc0;
+        int via01 = (r0k == INF || kc1 == INF) ? INF : r0k + kc1;
+        int via10 = (r1k == INF || kc0 == INF) ? INF : r1k + kc0;
+        int via11 = (r1k == INF || kc1 == INF) ? INF : r1k + kc1;
+
+        int idx00 = off_i * STRIDE + off_j;
+        int idx01 = off_i * STRIDE + off_j + 1;
+        int idx10 = (off_i + 1) * STRIDE + off_j;
+        int idx11 = (off_i + 1) * STRIDE + off_j + 1;
+
+        if (via00 < pivot[idx00]) pivot[idx00] = via00;
+        if (via01 < pivot[idx01]) pivot[idx01] = via01;
+        if (via10 < pivot[idx10]) pivot[idx10] = via10;
+        if (via11 < pivot[idx11]) pivot[idx11] = via11;
+
+        __syncthreads();
     }
+
+    if (row0 < nPad && col0 < nPad) Dist[row0 * nPad + col0] = pivot[off_i * STRIDE + off_j];
+    if (row0 < nPad && col1 < nPad) Dist[row0 * nPad + col1] = pivot[off_i * STRIDE + off_j + 1];
+    if (row1 < nPad && col0 < nPad) Dist[row1 * nPad + col0] = pivot[(off_i + 1) * STRIDE + off_j];
+    if (row1 < nPad && col1 < nPad) Dist[row1 * nPad + col1] = pivot[(off_i + 1) * STRIDE + off_j + 1];
 }
 
 // Phase 2: pivot row & pivot column blocks
@@ -62,127 +83,170 @@ __global__ void phase2(
     int* Dist,
     int  nPad,
     int  B,
-    int  r,           // current round index
-    int  numBlocks    // nPad / B
+    int  r,
+    int  numBlocks
 ){
-    int which = blockIdx.y;   // 0: row (r, j)  1: col (i, r)
+    int tyi = threadIdx.y; // 0..31
+    int txj = threadIdx.x; // 0..31
+    int off_i = (tyi << 1);
+    int off_j = (txj << 1);
 
-    // blockIdx.x ∈ [0, numBlocks-2]，映射成跳過 r 的 block index
+    const int STRIDE2 = B + 1;
+    __shared__ int tileA[64 * (64 + 1)];
+    __shared__ int tileB[64 * (64 + 1)];
+
+    int which = blockIdx.y; // 0=row, 1=col
     int t = blockIdx.x;
-    int coord = (t < r) ? t : t + 1;   // coord ∈ [0, numBlocks-1], coord != r
+    int coord = (t < r) ? t : t + 1;
+    int bi = (which == 0 ? r : coord);
+    int bj = (which == 0 ? coord : r);
 
-    int block_i, block_j;
-    if (which == 0) {
-        // pivot row: (r, coord)
-        block_i = r;
-        block_j = coord;
-    } else {
-        // pivot column: (coord, r)
-        block_i = coord;
-        block_j = r;
+    int base_i = bi * B + off_i;
+    int base_j = bj * B + off_j;
+
+    // load 2x2 micro-tile from Dist into shared tileA
+    for (int di = 0; di < 2; ++di) {
+        for (int dj = 0; dj < 2; ++dj) {
+            int gi = base_i + di;
+            int gj = base_j + dj;
+            if (gi < nPad && gj < nPad)
+                tileA[(off_i + di) * STRIDE2 + (off_j + dj)] = Dist[gi * nPad + gj];
+        }
+    }
+    // load pivot block (r,r) into tileB
+    for (int di = 0; di < 2; ++di) {
+        for (int dj = 0; dj < 2; ++dj) {
+            int gi = r * B + off_i + di;
+            int gj = r * B + off_j + dj;
+            if (gi < nPad && gj < nPad)
+                tileB[(off_i + di) * STRIDE2 + (off_j + dj)] = Dist[gi * nPad + gj];
+        }
     }
 
-    int block_start_x = block_i * B;
-    int block_start_y = block_j * B;
+    __syncthreads();
 
-    int i = block_start_x + threadIdx.y;
-    int j = block_start_y + threadIdx.x;
+    for (int k = 0; k < B; ++k) {
+        for (int di = 0; di < 2; ++di) {
+            int rowLocal = off_i + di;
+            int pivot_i_k = (which == 0) ? tileB[rowLocal * STRIDE2 + k] : tileA[rowLocal * STRIDE2 + k];
+            for (int dj = 0; dj < 2; ++dj) {
+                int colLocal = off_j + dj;
+                int other_k_j = (which == 0) ? tileA[k * STRIDE2 + colLocal] : tileB[k * STRIDE2 + colLocal];
+                int via = (pivot_i_k == INF || other_k_j == INF) ? INF : (pivot_i_k + other_k_j);
+                int idx = rowLocal * STRIDE2 + colLocal;
+                if (via < tileA[idx]) tileA[idx] = via;
+            }
+        }
+        __syncthreads();
+    }
 
-    int k_start = r * B;
-    int k_end   = k_start + B;
-
-    for (int k = k_start; k < k_end; ++k) {
-        int idx_ik = i * nPad + k;
-        int idx_kj = k * nPad + j;
-        int idx_ij = i * nPad + j;
-
-        int w1 = Dist[idx_ik];
-        int w2 = Dist[idx_kj];
-        if (w1 == INF || w2 == INF) continue;
-        int via = w1 + w2;
-        if (via < Dist[idx_ij])
-            Dist[idx_ij] = via;
+    for (int di = 0; di < 2; ++di) {
+        for (int dj = 0; dj < 2; ++dj) {
+            int gi = base_i + di;
+            int gj = base_j + dj;
+            if (gi < nPad && gj < nPad)
+                Dist[gi * nPad + gj] = tileA[(off_i + di) * STRIDE2 + (off_j + dj)];
+        }
     }
 }
 
 // Phase 3: other blocks (neither in row r nor col r)
 // gridDim = (numBlocks, numBlocks)
 __global__ void phase3(
-    int* Dist,
+    int* __restrict__ Dist,
     int  nPad,
     int  B,
     int  r,
     int  numBlocks
 ){
+    // thread mapping: each thread updates a 2x2 micro-tile
+    int ty = threadIdx.y; // 0..31
+    int tx = threadIdx.x; // 0..31
+    int off_i = (ty << 1);
+    int off_j = (tx << 1);
+
     int block_i = blockIdx.y;
     int block_j = blockIdx.x;
 
-    if (block_i == r || block_j == r)
-        return;
+    if (block_i == r || block_j == r) return;
 
-    int block_start_x = block_i * B;
-    int block_start_y = block_j * B;
+    // ===== SLICE SIZE = 64 (no slicing needed) =====
+    const int SLICE_K = 64;
 
-    int k_start = r * B;
-    int k_end   = k_start + B;
+    // ===== Shared memory: FULL pivot row + pivot column =====
+    __shared__ int pivotRowSlice[SLICE_K][SLICE_K]; // 64 x 64
+    __shared__ int pivotColSlice[SLICE_K][SLICE_K]; // 64 x 64
 
-    // 2×2 per thread coordinates
-    int i0 = block_start_x + (threadIdx.y << 1);
-    int j0 = block_start_y + (threadIdx.x << 1);
+    int base_i0 = block_i * B;
+    int base_j0 = block_j * B;
 
-    if (i0 >= block_start_x + B || j0 >= block_start_y + B)
-        return;
+    int row0 = base_i0 + off_i;
+    int row1 = row0 + 1;
+    int col0 = base_j0 + off_j;
+    int col1 = col0 + 1;
 
-    // ---- shared memory for pivot row and column ----
-    __shared__ int pivotRow[32][33];
-    __shared__ int pivotCol[32][33];
+    // === preload Dist[row][col] into registers ===
+    int best00 = Dist[row0 * nPad + col0];
+    int best01 = Dist[row0 * nPad + col1];
+    int best10 = Dist[row1 * nPad + col0];
+    int best11 = Dist[row1 * nPad + col1];
 
-    // load pivot row & col into shared memory
-    // reuse same 2×2 thread tiling
-    for (int kk = threadIdx.y; kk < B; kk += blockDim.y) {
-        for (int jj = threadIdx.x; jj < B; jj += blockDim.x) {
-            pivotRow[kk][jj] = Dist[ (k_start + kk) * nPad + (block_start_y + jj) ];
-            pivotCol[kk][jj] = Dist[ (block_start_x + jj) * nPad + (k_start + kk) ];
-        }
-    }
-    __syncthreads();
-
-    // preload 2×2 tile outputs
-    int idx00 = i0 * nPad + j0;
-    int d00 = Dist[idx00];
-    int idx01 = idx00 + 1;
-    int d01 = Dist[idx01];
-    int idx10 = idx00 + nPad;
-    int d10 = Dist[idx10];
-    int idx11 = idx10 + 1;
-    int d11 = Dist[idx11];
-
-    // ----- compute using shared pivot row & col -----
-    for (int kk = 0; kk < B; ++kk) {
-
-        int dik0 = pivotCol[kk][i0 - block_start_x];
-        int dik1 = pivotCol[kk][(i0+1) - block_start_x];
-
-        int dkj0 = pivotRow[kk][j0 - block_start_y];
-        int dkj1 = pivotRow[kk][(j0+1) - block_start_y];
-
-        if (dik0 != INF) {
-            if (dkj0 != INF) d00 = min(d00, dik0 + dkj0);
-            if (dkj1 != INF) d01 = min(d01, dik0 + dkj1);
-        }
-        if (dik1 != INF) {
-            if (dkj0 != INF) d10 = min(d10, dik1 + dkj0);
-            if (dkj1 != INF) d11 = min(d11, dik1 + dkj1);
+    // ============================================================
+    // Load FULL pivot row slice (64x64) into shared memory
+    // ============================================================
+    for (int kb = 0; kb < SLICE_K; kb += 32) {
+        int prow = r * B + kb + ty;
+        for (int cb = 0; cb < SLICE_K; cb += 32) {
+            int gj = base_j0 + cb + tx;
+            int v = (prow < nPad && gj < nPad) ? Dist[prow * nPad + gj] : INF;
+            pivotRowSlice[kb + ty][cb + tx] = v;
         }
     }
 
-    // write back
-    Dist[idx00] = d00;
-    Dist[idx01] = d01;
-    Dist[idx10] = d10;
-    Dist[idx11] = d11;
+    // ============================================================
+    // Load FULL pivot column slice (64x64) into shared memory
+    // ============================================================
+    for (int rb = 0; rb < SLICE_K; rb += 32) {
+        int grow = base_i0 + rb + ty;
+        for (int kb = 0; kb < SLICE_K; kb += 32) {
+            int pcol = r * B + kb + tx;
+            int v = (grow < nPad && pcol < nPad) ? Dist[grow * nPad + pcol] : INF;
+            pivotColSlice[rb + ty][kb + tx] = v;
+        }
+    }
+
+    __syncthreads(); // shared pivot fully ready
+
+    // ============================================================
+    // FULL kLocal loop: 0..63 (unrolled)
+    // ============================================================
+    #pragma unroll 64
+    for (int kLocal = 0; kLocal < SLICE_K; ++kLocal) {
+
+        int w_row0_k = pivotColSlice[off_i][kLocal];
+        int w_row1_k = pivotColSlice[off_i + 1][kLocal];
+        int w_k_col0 = pivotRowSlice[kLocal][off_j];
+        int w_k_col1 = pivotRowSlice[kLocal][off_j + 1];
+
+        int via00 = w_row0_k + w_k_col0;
+        int via01 = w_row0_k + w_k_col1;
+        int via10 = w_row1_k + w_k_col0;
+        int via11 = w_row1_k + w_k_col1;
+
+        best00 = min(best00, via00);
+        best01 = min(best01, via01);
+        best10 = min(best10, via10);
+        best11 = min(best11, via11);
+    }
+
+    // ============================================================
+    // Write back results
+    // ============================================================
+    Dist[row0 * nPad + col0] = best00;
+    Dist[row0 * nPad + col1] = best01;
+    Dist[row1 * nPad + col0] = best10;
+    Dist[row1 * nPad + col1] = best11;
 }
-
 
 // ======================================================
 // Input / Output（1D 展開）
@@ -202,13 +266,11 @@ void input(char* infile, int B, int** Dist_ptr, int* n_ptr, int* nPad_ptr){
     int nPad = ((n + B - 1) / B) * B;
     *nPad_ptr = nPad;
 
-    int* Dist = (int*)malloc(nPad * nPad * sizeof(int));
-    if (!Dist) {
-        fprintf(stderr, "malloc Dist failed\n");
-        exit(1);
-    }
+    int* Dist = NULL;
+    CUDA_CHECK( cudaMallocHost((void**)&Dist, nPad * nPad * sizeof(int)) ); // pinned host memory
 
     // 初始化：對角線 0，其餘 INF，padding 區也 INF
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i < nPad; ++i) {
         for (int j = 0; j < nPad; ++j) {
             if (i < n && j < n) {
@@ -221,6 +283,7 @@ void input(char* infile, int B, int** Dist_ptr, int* n_ptr, int* nPad_ptr){
 
     // 讀邊
     int edge[3];
+    #pragma omp parallel for
     for (int i = 0; i < m; ++i) {
         fread(edge, sizeof(int), 3, file);
         int u = edge[0], v = edge[1], w = edge[2];
@@ -237,6 +300,7 @@ void output(char* outfile, int* Dist, int n, int nPad){
         perror("fopen output");
         exit(1);
     }
+    #pragma omp parallel for
     for (int i = 0; i < n; ++i) {
         fwrite(&Dist[i*nPad], sizeof(int), n, out);
     }
@@ -251,8 +315,9 @@ void block_FW_CUDA(int* Dist, int n, int nPad, int B){
     int rounds    = nPad / B; // 一邊有多少個 blocks
     int numBlocks = rounds;
 
-    if (B * B > 1024) {
-        fprintf(stderr, "Error: B too large (B*B > 1024)\n");
+    // 檢查 thread 數量 (32x32 = 1024)，tile 尺寸與 thread 數分離
+    if (32 * 32 > 1024) {
+        fprintf(stderr, "Error: blockDim too large (>1024)\n");
         exit(1);
     }
 
@@ -262,36 +327,32 @@ void block_FW_CUDA(int* Dist, int n, int nPad, int B){
                            nPad*nPad*sizeof(int),
                            cudaMemcpyHostToDevice) );
 
-    dim3 blockDim(B, B);
+    // 使用 32x32 threads 映射到 64x64 tile (2x2 micro-tiles)
+    dim3 blockDim(32, 32);
 
     for (int r = 0; r < rounds; ++r) {
         // ===== Phase 1: pivot block (r,r) =====
-        {
-            dim3 gridPhase1(1, 1);
-            phase1<<<gridPhase1, dim3(1,1)>>>(Dist_d, nPad, B, r);
-            CUDA_CHECK( cudaDeviceSynchronize() );
-        }
+        dim3 gridPhase1(1, 1);
+        phase1<<<gridPhase1, blockDim>>>(Dist_d, nPad, B, r);
+            
 
         // ===== Phase 2: pivot row & column =====
-        {
-            dim3 gridPhase2(rounds - 1, 2); // x: 0..rounds-2, y: 0(row)/1(col)
-            phase2<<<gridPhase2, blockDim>>>(Dist_d, nPad, B, r, rounds);
-            CUDA_CHECK( cudaDeviceSynchronize() );
-        }
+
+        dim3 gridPhase2(rounds - 1, 2);   // x = all blocks except r, y = 0(row),1(col)
+        dim3 threadsPhase2(32, 32);
+        phase2<<<gridPhase2, threadsPhase2>>>(Dist_d, nPad, B, r, rounds);
+
 
         // ===== Phase 3: remaining blocks =====
-        {
-            dim3 gridPhase3(rounds, rounds);
-            dim3 blockDimPhase3(16,16);
-            phase3<<<gridPhase3, blockDimPhase3>>>(Dist_d, nPad, B, r, rounds);
-            CUDA_CHECK( cudaDeviceSynchronize() );
-        }
+
+        dim3 gridPhase3(rounds, rounds);
+        phase3<<<gridPhase3, blockDim>>>(Dist_d, nPad, B, r, rounds);
     }
 
-    CUDA_CHECK( cudaMemcpy(Dist, Dist_d,
+    cudaMemcpy(Dist, Dist_d,
                            nPad*nPad*sizeof(int),
-                           cudaMemcpyDeviceToHost) );
-    CUDA_CHECK( cudaFree(Dist_d) );
+                           cudaMemcpyDeviceToHost);
+    cudaFree(Dist_d);
 }
 
 
@@ -306,13 +367,12 @@ int main(int argc, char** argv){
 
     int *Dist;
     int n, nPad;
-    int B = 32;  // 記得確保 B*B <= 1024，B 是 block 大小
+    int B = 64;  // 64x64 tile；32x32 threads，每 thread 處理 2x2 微分塊
 
     input(argv[1], B, &Dist, &n, &nPad);
     block_FW_CUDA(Dist, n, nPad, B);
     output(argv[2], Dist, n, nPad);
 
-    free(Dist);
+    CUDA_CHECK( cudaFreeHost(Dist) );
     return 0;
 }
-
